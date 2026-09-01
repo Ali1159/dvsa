@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "DVSA Slot Scanner (Dual Site fetch mode)",
+  "description": "Fast DVSA slot scanner for both Instructor and Student portals with cross-tab snipe feature.",
+  "version": "0.0.4",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "https://*.dvsa.gov.uk/*",
+    "https://driverpracticaltest.dvsa.gov.uk/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.dvsa.gov.uk/*",
+        "https://driverpracticaltest.dvsa.gov.uk/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
