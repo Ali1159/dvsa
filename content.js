@@ -85,13 +85,19 @@
   const CONFIG = SITE_CONFIG[SITE_TYPE];
 
   // ============== GLOBAL CONFIG ==============
-  const STATE_KEY = "__dvsa4Scanning";
-  const DIR_KEY = "__dvsa4Dir";
   const SETTINGS_KEY = "__dvsa4Settings";
   const NONCE_KEY = "__dvsa4Nonce";
-  const REQ_COUNT_KEY = "__dvsa4ReqCount";
   const CLICK_COUNT_KEY = "__dvsa4ClickCount";
   const AUTO_RESUME_KEY = "__dvsa4AutoResume";
+  const MESSAGE_TYPES = {
+    REGISTER_TAB: 'REGISTER_TAB',
+    SNIPE_STATUS_UPDATE: 'SNIPE_STATUS_UPDATE',
+    GET_PAGE_INFO: 'GET_PAGE_INFO',
+    EXECUTE_SNIPE: 'EXECUTE_SNIPE',
+    EXECUTE_HTTP_SNIPE: 'EXECUTE_HTTP_SNIPE',
+    SNIPE_STATUS: 'SNIPE_STATUS',
+    SNIPE_FAILED: 'SNIPE_FAILED'
+  };
   
   const MAX_LOG_ITEMS = 50;
 
@@ -122,8 +128,6 @@
   };
 
   // ============== STATE ==============
-  let scanning = false;
-  let scanDirection = "next";
   let settings = loadSettings();
   let counters = { 
     slots: 0, 
@@ -145,8 +149,6 @@
   // Nonce and referer
   let latestNonce = localStorage.getItem(NONCE_KEY) || extractNonceFromPage();
   let lastReferer = location.href;
-  let requestCount = parseInt(localStorage.getItem(REQ_COUNT_KEY) || "0", 10);
-  
   // Mouse simulator
   let mouseSimulatorInterval = null;
 
@@ -173,7 +175,7 @@
   function registerTabWithBackground() {
     try {
       chrome.runtime.sendMessage({
-        type: 'REGISTER_TAB',
+        type: MESSAGE_TYPES.REGISTER_TAB,
         siteType: SITE_TYPE
       }, () => {
         void chrome.runtime?.lastError;
@@ -184,7 +186,7 @@
   function sendSnipeStatus(status, details) {
     try {
       chrome.runtime.sendMessage({
-        type: 'SNIPE_STATUS_UPDATE',
+        type: MESSAGE_TYPES.SNIPE_STATUS_UPDATE,
         status,
         details
       }, () => {
@@ -247,6 +249,7 @@
       const text = getSlotText(slot);
       const textNoSpace = text.replace(/\s+/g, '');
       const slotTimestamp = getSlotTimestamp(slot);
+      if (!isSlotWithinDateRange(slotTimestamp)) continue;
 
       if (wantedTimestamp && slotTimestamp) {
         const diff = Math.abs(slotTimestamp - wantedTimestamp);
@@ -263,11 +266,47 @@
       }
     }
 
-    if (bestScore <= 0) return slots[0];
     return best;
   }
 
+  function normalizeDate(value) {
+    if (!value) return null;
+    const timestamp = Date.parse(value);
+    if (Number.isNaN(timestamp)) return null;
+    return new Date(timestamp).toISOString().slice(0, 10);
+  }
+
+  function getDateRangeBounds() {
+    const start = normalizeDate(settings.startDate);
+    const end = normalizeDate(settings.endDate);
+    if (start && end && start > end) {
+      return { start: end, end: start };
+    }
+    return { start, end };
+  }
+
+  function isDateWithinConfiguredRange(dateIso) {
+    if (!dateIso) return true;
+    const { start, end } = getDateRangeBounds();
+    if (start && dateIso < start) return false;
+    if (end && dateIso > end) return false;
+    return true;
+  }
+
+  function isSlotWithinDateRange(slotTimestamp) {
+    if (!Number.isFinite(slotTimestamp)) return true;
+    return isDateWithinConfiguredRange(new Date(slotTimestamp).toISOString().slice(0, 10));
+  }
+
+  function canReserveMoreSlots() {
+    const limit = Math.max(1, Number(settings.maxReserves) || 1);
+    return counters.reserves < limit;
+  }
+
   async function submitStudentSlotViaDom(slot, delayMs = 0) {
+    if (!canReserveMoreSlots()) {
+      throw new Error(`Max reserves reached (${settings.maxReserves}).`);
+    }
     slot.checked = true;
     slot.dispatchEvent(new Event('change', { bubbles: true }));
     slot.click();
@@ -289,6 +328,9 @@
   }
 
   async function submitStudentSlotViaHttp(slot, opts = {}) {
+    if (!canReserveMoreSlots()) {
+      throw new Error(`Max reserves reached (${settings.maxReserves}).`);
+    }
     const form = document.querySelector('#slot-picker-form');
     if (!form) {
       throw new Error('Slot form not found on student portal page.');
@@ -347,6 +389,9 @@
     if (SITE_TYPE !== 'STUDENT') {
       return { success: false, error: 'Snipe execution requires an open student portal tab.' };
     }
+    if (!canReserveMoreSlots()) {
+      return { success: false, error: `Max reserves reached (${settings.maxReserves}).` };
+    }
 
     const preferredTimestamp = Number.isFinite(options.timestamp) ? options.timestamp : null;
     const targetSlot = findBestStudentSlot(snipeData, preferredTimestamp);
@@ -383,7 +428,7 @@
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (async () => {
         switch (message?.type) {
-          case 'GET_PAGE_INFO':
+          case MESSAGE_TYPES.GET_PAGE_INFO:
             sendResponse({
               success: true,
               siteType: SITE_TYPE,
@@ -393,13 +438,13 @@
             });
             break;
 
-          case 'EXECUTE_SNIPE': {
+          case MESSAGE_TYPES.EXECUTE_SNIPE: {
             const result = await executeStudentSnipeRequest(message.snipeData || {}, { useHttpOnly: false });
             sendResponse(result);
             break;
           }
 
-          case 'EXECUTE_HTTP_SNIPE': {
+          case MESSAGE_TYPES.EXECUTE_HTTP_SNIPE: {
             const result = await executeStudentSnipeRequest(message.snipeData || {}, {
               useHttpOnly: true,
               csrf: message.csrf,
@@ -410,13 +455,13 @@
             break;
           }
 
-          case 'SNIPE_STATUS':
+          case MESSAGE_TYPES.SNIPE_STATUS:
             if (message.details) log(`📡 ${message.details}`, true);
             if (message.details) setStatus(message.details);
             sendResponse({ success: true });
             break;
 
-          case 'SNIPE_FAILED':
+          case MESSAGE_TYPES.SNIPE_FAILED:
             if (message.reason) log(`❌ ${message.reason}`, true);
             if (message.reason) setStatus(`❌ ${message.reason}`);
             sendResponse({ success: true });
@@ -707,6 +752,7 @@
         const slotUrl = slotLink.getAttribute('href');
         if (slotUrl) {
           const dateInfo = extractDateFromCell(cell, doc);
+          if (dateInfo && !isDateWithinConfiguredRange(dateInfo)) continue;
           return {
             found: true,
             slotUrl: buildUrl(slotUrl),
@@ -725,7 +771,8 @@
     const slots = slotList.querySelectorAll(CONFIG.slotLinkSelector);
     if (slots.length === 0) return null;
     
-    const firstSlot = slots[0];
+    const firstSlot = Array.from(slots).find((slot) => isSlotWithinDateRange(getSlotTimestamp(slot)));
+    if (!firstSlot) return null;
     const slotId = firstSlot.id || firstSlot.value;
     const dateLabel = firstSlot.getAttribute('data-datetime-label') || '';
     
@@ -801,6 +848,11 @@
   // ============== MAIN FETCH SCAN LOOP ==============
   async function startFetchScan(direction) {
     if (fetchScanActive) return;
+    if (!canReserveMoreSlots()) {
+      setStatus(`⚠️ Max reserves reached (${settings.maxReserves})`);
+      log(`⚠️ Max reserves reached (${settings.maxReserves})`, true);
+      return;
+    }
     
     sessionRequestCount = 0;
     
@@ -964,6 +1016,9 @@
 
   async function executeReserve(reserveUrl) {
     try {
+      if (!canReserveMoreSlots()) {
+        throw new Error(`Max reserves reached (${settings.maxReserves}).`);
+      }
       const reserveDoc = await fetchPage(reserveUrl);
       
       const errorIndicator = reserveDoc.querySelector('.error, .warning, [class*="error"]');

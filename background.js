@@ -10,6 +10,18 @@
 // Track active tabs
 let instructorTabId = null;
 let studentTabId = null;
+const MESSAGE_TYPES = {
+  REGISTER_TAB: 'REGISTER_TAB',
+  SNIPE_REQUEST: 'SNIPE_REQUEST',
+  SNIPE_REQUEST_HTTP_ONLY: 'SNIPE_REQUEST_HTTP_ONLY',
+  SNIPE_STATUS_UPDATE: 'SNIPE_STATUS_UPDATE',
+  GET_TAB_INFO: 'GET_TAB_INFO',
+  GET_PAGE_INFO: 'GET_PAGE_INFO',
+  EXECUTE_HTTP_SNIPE: 'EXECUTE_HTTP_SNIPE',
+  EXECUTE_SNIPE: 'EXECUTE_SNIPE',
+  SNIPE_STATUS: 'SNIPE_STATUS',
+  SNIPE_FAILED: 'SNIPE_FAILED'
+};
 
 // Listen for messages from content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -19,28 +31,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
       switch (message.type) {
-        case 'REGISTER_TAB':
+        case MESSAGE_TYPES.REGISTER_TAB:
           handleTabRegistration(message, sender);
           sendResponse({ success: true });
           break;
           
-        case 'SNIPE_REQUEST':
+        case MESSAGE_TYPES.SNIPE_REQUEST:
           await handleSnipeRequest(message, sender);
           sendResponse({ success: true });
           break;
           
-        case 'SNIPE_REQUEST_HTTP_ONLY':
+        case MESSAGE_TYPES.SNIPE_REQUEST_HTTP_ONLY:
           // New: HTTP-only snipe without opening calendar tab
           await handleHttpOnlySnipe(message, sender);
           sendResponse({ success: true });
           break;
           
-        case 'SNIPE_STATUS_UPDATE':
+        case MESSAGE_TYPES.SNIPE_STATUS_UPDATE:
           await handleSnipeStatusUpdate(message, sender);
           sendResponse({ success: true });
           break;
           
-        case 'GET_TAB_INFO':
+        case MESSAGE_TYPES.GET_TAB_INFO:
           sendResponse({
             instructorTabId,
             studentTabId,
@@ -116,7 +128,7 @@ async function handleHttpOnlySnipe(message, sender) {
   
   // Notify instructor of progress
   notifyInstructorTab({
-    type: 'SNIPE_STATUS',
+    type: MESSAGE_TYPES.SNIPE_STATUS,
     status: 'processing',
     details: 'Starting HTTP-only snipe...'
   });
@@ -138,10 +150,10 @@ async function handleHttpOnlySnipe(message, sender) {
     
     // Step 2: Get current execution and CSRF from student tab
     const pageInfo = await chrome.tabs.sendMessage(studentTab.id, {
-      type: 'GET_PAGE_INFO'
+      type: MESSAGE_TYPES.GET_PAGE_INFO
     });
     
-    if (!pageInfo || !pageInfo.csrf || !pageInfo.execution) {
+    if (!pageInfo?.success || !pageInfo.csrf || !pageInfo.execution) {
       console.warn('[Background] Missing CSRF/execution, falling back to tab-assisted snipe');
       await executeDomFallbackSnipe(studentTab, snipeData, 'Missing CSRF/execution');
       return;
@@ -155,7 +167,7 @@ async function handleHttpOnlySnipe(message, sender) {
     
     // Step 4: Perform HTTP POST via content script (for cookie access)
     const result = await chrome.tabs.sendMessage(studentTab.id, {
-      type: 'EXECUTE_HTTP_SNIPE',
+      type: MESSAGE_TYPES.EXECUTE_HTTP_SNIPE,
       csrf: pageInfo.csrf,
       execution: pageInfo.execution,
       timestamp: timestamp,
@@ -165,7 +177,7 @@ async function handleHttpOnlySnipe(message, sender) {
     if (result.success) {
       console.log('[Background] HTTP snipe successful!');
       notifyInstructorTab({
-        type: 'SNIPE_STATUS',
+        type: MESSAGE_TYPES.SNIPE_STATUS,
         status: 'completed',
         details: 'Slot reserved successfully!'
       });
@@ -194,13 +206,13 @@ async function handleHttpOnlySnipe(message, sender) {
         await executeDomFallbackSnipe(studentTabs[0], snipeData, error.message || 'Unexpected error');
       } else {
         notifyInstructorTab({
-          type: 'SNIPE_FAILED',
+          type: MESSAGE_TYPES.SNIPE_FAILED,
           reason: error.message
         });
       }
     } catch (fallbackError) {
       notifyInstructorTab({
-        type: 'SNIPE_FAILED',
+        type: MESSAGE_TYPES.SNIPE_FAILED,
         reason: fallbackError?.message || error?.message || 'Snipe failed'
       });
     }
@@ -209,13 +221,13 @@ async function handleHttpOnlySnipe(message, sender) {
 
 async function executeDomFallbackSnipe(studentTab, snipeData, reason) {
   notifyInstructorTab({
-    type: 'SNIPE_STATUS',
+    type: MESSAGE_TYPES.SNIPE_STATUS,
     status: 'processing',
     details: `HTTP-only unavailable (${reason}). Falling back to tab-assisted mode...`
   });
 
   await chrome.tabs.sendMessage(studentTab.id, {
-    type: 'EXECUTE_SNIPE',
+    type: MESSAGE_TYPES.EXECUTE_SNIPE,
     snipeData
   });
 
@@ -245,7 +257,7 @@ async function handleSnipeRequest(message, sender) {
     console.log('[Background] No student tab found!');
     // Notify instructor tab of failure
     notifyInstructorTab({
-      type: 'SNIPE_FAILED',
+      type: MESSAGE_TYPES.SNIPE_FAILED,
       reason: 'No student portal tab found. Please open the student portal first.'
     });
     return;
@@ -259,7 +271,7 @@ async function handleSnipeRequest(message, sender) {
   // Send snipe request to student tab
   try {
     await chrome.tabs.sendMessage(studentTab.id, {
-      type: 'EXECUTE_SNIPE',
+      type: MESSAGE_TYPES.EXECUTE_SNIPE,
       snipeData
     });
     
@@ -269,7 +281,7 @@ async function handleSnipeRequest(message, sender) {
   } catch (error) {
     console.error('[Background] Failed to send to student tab:', error);
     notifyInstructorTab({
-      type: 'SNIPE_FAILED',
+      type: MESSAGE_TYPES.SNIPE_FAILED,
       reason: 'Failed to communicate with student tab. Please refresh the student portal page.'
     });
   }
@@ -295,7 +307,7 @@ async function handleSnipeStatusUpdate(message, sender) {
   
   // Notify instructor tab of status
   notifyInstructorTab({
-    type: 'SNIPE_STATUS',
+    type: MESSAGE_TYPES.SNIPE_STATUS,
     status,
     details
   });
