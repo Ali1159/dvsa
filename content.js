@@ -169,6 +169,270 @@
   let currentRps = 0;
   let currentCps = 0;
 
+  // ============== BACKGROUND MESSAGING ==============
+  function registerTabWithBackground() {
+    try {
+      chrome.runtime.sendMessage({
+        type: 'REGISTER_TAB',
+        siteType: SITE_TYPE
+      }, () => {
+        void chrome.runtime?.lastError;
+      });
+    } catch (_) {}
+  }
+
+  function sendSnipeStatus(status, details) {
+    try {
+      chrome.runtime.sendMessage({
+        type: 'SNIPE_STATUS_UPDATE',
+        status,
+        details
+      }, () => {
+        void chrome.runtime?.lastError;
+      });
+    } catch (_) {}
+  }
+
+  function extractExecutionFromPage() {
+    const executionInput = document.querySelector('input[name="execution"]');
+    if (executionInput?.value) return executionInput.value;
+
+    const urlExecution = new URLSearchParams(location.search).get('execution');
+    if (urlExecution) return urlExecution;
+
+    return null;
+  }
+
+  function getSlotText(slot) {
+    if (!slot) return '';
+    const idMatch = slot.id ? document.querySelector(`label[for="${slot.id}"]`) : null;
+    const labelText = idMatch?.textContent || '';
+    const attrText = slot.getAttribute('data-datetime-label') || slot.getAttribute('aria-label') || '';
+    return `${labelText} ${attrText}`.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function getSlotTimestamp(slot) {
+    if (!slot) return null;
+
+    const candidates = [
+      slot.getAttribute('data-datetime-label'),
+      slot.getAttribute('data-datetime'),
+      slot.dataset?.datetime,
+      slot.dataset?.datetimeLabel
+    ].filter(Boolean);
+
+    for (const text of candidates) {
+      const t = Date.parse(text);
+      if (!Number.isNaN(t)) return t;
+    }
+
+    const idNum = Number(slot.id || slot.value);
+    if (Number.isFinite(idNum) && idNum > 100000000000) return idNum;
+
+    return null;
+  }
+
+  function findBestStudentSlot(snipeData = {}, preferredTimestamp = null) {
+    const slots = Array.from(document.querySelectorAll('input.SlotPicker-slot[type="radio"]'));
+    if (!slots.length) return null;
+
+    const wantedTime = (snipeData.time || '').toLowerCase().replace(/\s+/g, '');
+    const wantedDate = (snipeData.date || '').toLowerCase();
+    const wantedTimestamp = Number.isFinite(preferredTimestamp) ? preferredTimestamp : null;
+    let best = null;
+    let bestScore = -1;
+
+    for (const slot of slots) {
+      let score = 0;
+      const text = getSlotText(slot);
+      const textNoSpace = text.replace(/\s+/g, '');
+      const slotTimestamp = getSlotTimestamp(slot);
+
+      if (wantedTimestamp && slotTimestamp) {
+        const diff = Math.abs(slotTimestamp - wantedTimestamp);
+        if (diff <= 60000) score += 100;
+        else if (diff <= 5 * 60000) score += 60;
+      }
+
+      if (wantedTime && textNoSpace.includes(wantedTime)) score += 30;
+      if (wantedDate && text.includes(wantedDate)) score += 20;
+
+      if (score > bestScore) {
+        best = slot;
+        bestScore = score;
+      }
+    }
+
+    if (bestScore <= 0) return slots[0];
+    return best;
+  }
+
+  async function submitStudentSlotViaDom(slot, delayMs = 0) {
+    slot.checked = true;
+    slot.dispatchEvent(new Event('change', { bubbles: true }));
+    slot.click();
+    trackClick('slot');
+
+    const submitBtn = document.querySelector('#slot-picker-form button[type="submit"], #slot-picker-form input[type="submit"], .continue-button');
+    if (!submitBtn) {
+      throw new Error('Submit button not found on student portal page.');
+    }
+
+    if (delayMs > 0) {
+      await sleep(delayMs);
+    }
+
+    submitBtn.click();
+    trackClick('submit');
+    bump("requests");
+    bump("reserves");
+  }
+
+  async function submitStudentSlotViaHttp(slot, opts = {}) {
+    const form = document.querySelector('#slot-picker-form');
+    if (!form) {
+      throw new Error('Slot form not found on student portal page.');
+    }
+
+    const actionUrl = buildUrl(form.getAttribute('action') || location.href);
+    const formData = new FormData(form);
+
+    if (slot.name) formData.set(slot.name, slot.value || slot.id || '');
+    if (opts.execution) formData.set('execution', opts.execution);
+    if (opts.csrf) formData.set('org.apache.catalina.filters.CSRF_NONCE', opts.csrf);
+
+    const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (submitBtn?.name) {
+      formData.set(submitBtn.name, submitBtn.value || 'Continue');
+    }
+
+    const body = new URLSearchParams();
+    for (const [key, value] of formData.entries()) {
+      body.append(key, String(value));
+    }
+
+    const response = await fetch(actionUrl, {
+      method: 'POST',
+      credentials: 'include',
+      redirect: 'manual',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': location.href,
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      body: body.toString()
+    });
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const locationHeader = response.headers.get('location');
+      return locationHeader ? new URL(locationHeader, location.href).toString() : null;
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const errorIndicator = doc.querySelector('.error, .warning, [class*="error"]');
+    if (errorIndicator) {
+      throw new Error(errorIndicator.textContent?.trim() || 'Reservation was rejected.');
+    }
+
+    return response.url || null;
+  }
+
+  async function executeStudentSnipeRequest(snipeData = {}, options = {}) {
+    if (SITE_TYPE !== 'STUDENT') {
+      return { success: false, error: 'Snipe execution requires an open student portal tab.' };
+    }
+
+    const preferredTimestamp = Number.isFinite(options.timestamp) ? options.timestamp : null;
+    const targetSlot = findBestStudentSlot(snipeData, preferredTimestamp);
+    if (!targetSlot) {
+      return { success: false, error: 'No bookable slots are visible on the student portal page.' };
+    }
+
+    try {
+      sendSnipeStatus('processing', 'Processing slot reservation on student tab...');
+
+      let redirectUrl = null;
+      if (options.useHttpOnly) {
+        redirectUrl = await submitStudentSlotViaHttp(targetSlot, options);
+      } else {
+        const reservationDelay = Math.max(0, getCurrentReservationDelay());
+        await submitStudentSlotViaDom(targetSlot, reservationDelay);
+      }
+
+      setStatus('✅ Snipe completed');
+      log('🎯 Background snipe completed', true);
+      sendSnipeStatus('completed', 'Slot reservation completed.');
+
+      return { success: true, redirectUrl };
+    } catch (error) {
+      const reason = error?.message || 'Unknown snipe error';
+      setStatus(`❌ Snipe failed`);
+      log(`❌ Background snipe failed: ${reason}`, true);
+      sendSnipeStatus('failed', reason);
+      return { success: false, error: reason };
+    }
+  }
+
+  function setupRuntimeMessaging() {
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      (async () => {
+        switch (message?.type) {
+          case 'GET_PAGE_INFO':
+            sendResponse({
+              success: true,
+              siteType: SITE_TYPE,
+              csrf: extractNonceFromPage() || latestNonce || null,
+              execution: extractExecutionFromPage(),
+              url: location.href
+            });
+            break;
+
+          case 'EXECUTE_SNIPE': {
+            const result = await executeStudentSnipeRequest(message.snipeData || {}, { useHttpOnly: false });
+            sendResponse(result);
+            break;
+          }
+
+          case 'EXECUTE_HTTP_SNIPE': {
+            const result = await executeStudentSnipeRequest(message.snipeData || {}, {
+              useHttpOnly: true,
+              csrf: message.csrf,
+              execution: message.execution,
+              timestamp: message.timestamp
+            });
+            sendResponse(result);
+            break;
+          }
+
+          case 'SNIPE_STATUS':
+            if (message.details) log(`📡 ${message.details}`, true);
+            if (message.details) setStatus(message.details);
+            sendResponse({ success: true });
+            break;
+
+          case 'SNIPE_FAILED':
+            if (message.reason) log(`❌ ${message.reason}`, true);
+            if (message.reason) setStatus(`❌ ${message.reason}`);
+            sendResponse({ success: true });
+            break;
+
+          default:
+            sendResponse({ success: false, error: 'Unknown message type' });
+        }
+      })().catch((error) => {
+        sendResponse({ success: false, error: error?.message || 'Unhandled message error' });
+      });
+
+      return true;
+    });
+  }
+
   // ============== AUTO-REFRESH LOGIC ==============
   function checkAndHandleAutoRefresh() {
     if (!autoRefreshEnabled) return false;
@@ -1549,6 +1813,11 @@
   }
   
   function init() {
+    setupRuntimeMessaging();
+    registerTabWithBackground();
+    window.addEventListener('focus', registerTabWithBackground);
+    window.addEventListener('pageshow', registerTabWithBackground);
+
     initUI();
     startMouseSimulator();
     setupKeyboardControls();
