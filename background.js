@@ -142,7 +142,9 @@ async function handleHttpOnlySnipe(message, sender) {
     });
     
     if (!pageInfo || !pageInfo.csrf || !pageInfo.execution) {
-      throw new Error('Could not get CSRF/execution from student page. Please refresh the page.');
+      console.warn('[Background] Missing CSRF/execution, falling back to tab-assisted snipe');
+      await executeDomFallbackSnipe(studentTab, snipeData, 'Missing CSRF/execution');
+      return;
     }
     
     console.log('[Background] Got page info:', pageInfo.execution);
@@ -178,16 +180,46 @@ async function handleHttpOnlySnipe(message, sender) {
         await chrome.tabs.update(studentTab.id, { active: true });
       }
     } else {
-      throw new Error(result.error || 'HTTP snipe failed');
+      console.warn('[Background] HTTP-only snipe failed, falling back:', result.error);
+      await executeDomFallbackSnipe(studentTab, snipeData, result.error || 'HTTP flow failed');
     }
     
   } catch (error) {
     console.error('[Background] HTTP-only snipe error:', error);
-    notifyInstructorTab({
-      type: 'SNIPE_FAILED',
-      reason: error.message
-    });
+    try {
+      const studentTabs = await chrome.tabs.query({
+        url: ['https://driverpracticaltest.dvsa.gov.uk/*']
+      });
+      if (studentTabs.length > 0) {
+        await executeDomFallbackSnipe(studentTabs[0], snipeData, error.message || 'Unexpected error');
+      } else {
+        notifyInstructorTab({
+          type: 'SNIPE_FAILED',
+          reason: error.message
+        });
+      }
+    } catch (fallbackError) {
+      notifyInstructorTab({
+        type: 'SNIPE_FAILED',
+        reason: fallbackError?.message || error?.message || 'Snipe failed'
+      });
+    }
   }
+}
+
+async function executeDomFallbackSnipe(studentTab, snipeData, reason) {
+  notifyInstructorTab({
+    type: 'SNIPE_STATUS',
+    status: 'processing',
+    details: `HTTP-only unavailable (${reason}). Falling back to tab-assisted mode...`
+  });
+
+  await chrome.tabs.sendMessage(studentTab.id, {
+    type: 'EXECUTE_SNIPE',
+    snipeData
+  });
+
+  await chrome.tabs.update(studentTab.id, { active: true });
 }
 
 // Handle snipe request from Instructor tab
@@ -307,6 +339,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     studentTabId = null;
     chrome.storage.local.remove('studentTabId');
   }
+});
+
+chrome.storage.local.get(['instructorTabId', 'studentTabId'], (stored) => {
+  instructorTabId = stored?.instructorTabId ?? null;
+  studentTabId = stored?.studentTabId ?? null;
 });
 
 console.log('[Background] DVSA Slot Scanner v4 service worker started');
